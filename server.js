@@ -1,8 +1,7 @@
 /**
- * Chaster Lite – simple Node.js server (no external deps)
+ * GrokLock – simple Node.js server (no external deps)
  * Stores sessions in ./data/sessions.json and images in ./uploads/
  * Run: node server.js
- * Then open http://localhost:3847
  */
 
 const http = require('http');
@@ -16,12 +15,10 @@ const DATA_DIR = path.join(__dirname, 'data');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 
-// Ensure directories
 [DATA_DIR, UPLOAD_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
 
-// ---------- Session store ----------
 function loadSessions() {
   try {
     if (fs.existsSync(SESSIONS_FILE)) {
@@ -39,7 +36,6 @@ function saveSessions(sessions) {
 
 let sessions = loadSessions();
 
-// Clean very old sessions (> 30 days) on start
 const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
 Object.keys(sessions).forEach(code => {
   if (Date.now() - (sessions[code].createdAt || 0) > THIRTY_DAYS) {
@@ -52,9 +48,7 @@ Object.keys(sessions).forEach(code => {
 });
 saveSessions(sessions);
 
-// ---------- Helpers ----------
 function generateSessionCode() {
-  // Short readable code: 4 letters + 4 digits
   const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
   const digits = '23456789';
   let code = '';
@@ -79,7 +73,7 @@ function parseBody(req) {
     let body = '';
     req.on('data', chunk => {
       body += chunk;
-      if (body.length > 15 * 1024 * 1024) { // 15 MB limit
+      if (body.length > 15 * 1024 * 1024) {
         reject(new Error('Body too large'));
         req.destroy();
       }
@@ -115,20 +109,19 @@ function publicSession(session, revealCombo = false) {
     durationMs: session.durationMs,
     unlockedAt: session.unlockedAt || null,
     unlockReason: session.unlockReason || null,
-    createdAt: session.createdAt
+    createdAt: session.createdAt,
+    keyholderTakenControl: !!session.keyholderTakenControl
   };
   if (revealCombo && session.status === 'unlocked') {
     if (session.fallbackCode) out.fallbackCode = session.fallbackCode;
-    // image is served via separate endpoint when unlocked
   }
   return out;
 }
 
-// ---------- API handlers ----------
 async function handleCreate(req, res) {
   try {
     const body = await parseBody(req);
-    const { durationMs, pin, imageBase64, mimeType } = body;
+    const { durationMs, pin, imageBase64 } = body;
 
     if (!durationMs || durationMs < 60 * 1000) {
       return json(res, 400, { error: 'Duration must be at least 1 minute' });
@@ -171,7 +164,8 @@ async function handleCreate(req, res) {
       fallbackCode,
       unlockedAt: null,
       unlockReason: null,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      keyholderTakenControl: false
     };
 
     sessions[code] = session;
@@ -192,7 +186,6 @@ async function handleGet(req, res, code) {
   const session = sessions[code];
   if (!session) return json(res, 404, { error: 'Session not found' });
 
-  // Auto-unlock if timer expired
   if (session.status === 'locked' && !session.frozen && getRemaining(session) <= 0) {
     session.status = 'unlocked';
     session.unlockedAt = Date.now();
@@ -215,12 +208,14 @@ async function handleKeyholderAction(req, res, code) {
       return json(res, 400, { error: 'Lock is already unlocked' });
     }
 
-    // PIN check
     if (session.pin) {
       if (!pin || pin !== session.pin) {
         return json(res, 403, { error: 'Invalid keyholder PIN' });
       }
     }
+
+    // Once any successful keyholder action is performed, mark control as taken
+    session.keyholderTakenControl = true;
 
     if (action === 'add_time') {
       const delta = (Number(minutes) || 0) * 60 * 1000;
@@ -288,8 +283,11 @@ async function handleDiscard(req, res, code) {
     const session = sessions[code];
     if (!session) return json(res, 404, { error: 'Not found' });
 
-    // Optional: require a discard token or just allow anyone with the code for simplicity
-    // For personal use we allow discard with the session code.
+    // Once the keyholder has taken control, the wearer can no longer discard digitally
+    if (session.keyholderTakenControl) {
+      return json(res, 403, { error: 'Keyholder has taken control. Only the physical safety key can release you.' });
+    }
+
     if (session.imageFile) {
       try { fs.unlinkSync(path.join(UPLOAD_DIR, session.imageFile)); } catch (_) {}
     }
@@ -301,7 +299,6 @@ async function handleDiscard(req, res, code) {
   }
 }
 
-// ---------- Static file server ----------
 const MIME = {
   '.html': 'text/html',
   '.js': 'application/javascript',
@@ -314,7 +311,6 @@ const MIME = {
 
 function serveStatic(req, res, urlPath) {
   let filePath = path.join(__dirname, urlPath === '/' ? 'index.html' : urlPath);
-  // Security: prevent path traversal
   if (!filePath.startsWith(__dirname)) {
     res.writeHead(403);
     return res.end('Forbidden');
@@ -328,9 +324,7 @@ function serveStatic(req, res, urlPath) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-// ---------- Main server ----------
 const server = http.createServer(async (req, res) => {
-  // CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -344,7 +338,6 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   try {
-    // API routes
     if (pathname === '/api/create' && req.method === 'POST') {
       return await handleCreate(req, res);
     }
@@ -366,7 +359,6 @@ const server = http.createServer(async (req, res) => {
       return await handleDiscard(req, res, discardMatch[1].toUpperCase());
     }
 
-    // Static files
     if (req.method === 'GET') {
       return serveStatic(req, res, pathname);
     }
@@ -378,7 +370,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`\n🔒 Chaster Lite running at http://localhost:${PORT}`);
-  console.log(`   Share the URL + session code with your keyholder.\n`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n🔒 GrokLock running on port ${PORT}`);
+  console.log(`   Share the public URL + session code with your keyholder.\n`);
 });
